@@ -5,7 +5,9 @@
 //! [`ThreadedRegistration`], which allow users to register handlers for a given
 //! IRQ line.
 
+use core::ffi::c_void;
 use core::marker::PhantomPinned;
+use core::ptr::NonNull;
 
 use crate::alloc::Allocator;
 use crate::device::{Bound, Device};
@@ -60,7 +62,7 @@ impl<T: ?Sized + Handler, A: Allocator> Handler for Box<T, A> {
 #[pin_data(PinnedDrop)]
 struct RegistrationInner {
     irq: u32,
-    cookie: *mut c_void,
+    cookie: NonNull<c_void>,
 }
 
 impl RegistrationInner {
@@ -83,7 +85,7 @@ impl PinnedDrop for RegistrationInner {
         //
         // Notice that this will block until all handlers finish executing,
         // i.e.: at no point will &self be invalid while the handler is running.
-        unsafe { bindings::free_irq(self.irq, self.cookie) };
+        unsafe { bindings::free_irq(self.irq, self.cookie.as_ptr()) };
     }
 }
 
@@ -205,33 +207,40 @@ impl<T: Handler + 'static> Registration<T> {
     ) -> impl PinInit<Self, Error> + 'a {
         try_pin_init!(&this in Self {
             handler <- handler,
-            inner <- Devres::new(
-                request.dev,
-                try_pin_init!(RegistrationInner {
-                    // INVARIANT: `this` is a valid pointer to the `Registration` instance
-                    cookie: this.as_ptr().cast::<c_void>(),
-                    irq: {
-                        // SAFETY:
-                        // - The callbacks are valid for use with request_irq.
-                        // - If this succeeds, the slot is guaranteed to be valid until the
-                        //   destructor of Self runs, which will deregister the callbacks
-                        //   before the memory location becomes invalid.
-                        // - When request_irq is called, everything that handle_irq_callback will
-                        //   touch has already been initialized, so it's safe for the callback to
-                        //   be called immediately.
-                        to_result(unsafe {
-                            bindings::request_irq(
-                                request.irq,
-                                Some(handle_irq_callback::<T>),
-                                flags.into_inner(),
-                                name.as_char_ptr(),
-                                this.as_ptr().cast::<c_void>(),
-                            )
-                        })?;
-                        request.irq
-                    }
-                })
-            ),
+            inner <- {
+                let cookie = unsafe {
+                    // SAFETY: `this` is guaranteed by pin-init to point to a valid,
+                    // initialized `Registration` instance and cannot be null.
+                    NonNull::new_unchecked(this.as_ptr().cast::<c_void>() as *mut c_void)
+                };
+                Devres::new(
+                    request.dev,
+                    try_pin_init!(RegistrationInner {
+                        // INVARIANT: `this` is a valid pointer to the `Registration` instance
+                        cookie,
+                        irq: {
+                            // SAFETY:
+                            // - The callbacks are valid for use with request_irq.
+                            // - If this succeeds, the slot is guaranteed to be valid until the
+                            //   destructor of Self runs, which will deregister the callbacks
+                            //   before the memory location becomes invalid.
+                            // - When request_irq is called, everything that handle_irq_callback will
+                            //   touch has already been initialized, so it's safe for the callback to
+                            //   be called immediately.
+                            to_result(unsafe {
+                                bindings::request_irq(
+                                    request.irq,
+                                    Some(handle_irq_callback::<T>),
+                                    flags.into_inner(),
+                                    name.as_char_ptr(),
+                                    cookie.as_ptr(),
+                                )
+                            })?;
+                            request.irq
+                        }
+                    }),
+                )
+            },
             _pin: PhantomPinned,
         })
     }
@@ -261,9 +270,17 @@ impl<T: Handler + 'static> Registration<T> {
 /// # Safety
 ///
 /// This function should be only used as the callback in `request_irq`.
-unsafe extern "C" fn handle_irq_callback<T: Handler>(_irq: i32, ptr: *mut c_void) -> c_uint {
-    // SAFETY: `ptr` is a pointer to `Registration<T>` set in `Registration::new`
-    let registration = unsafe { &*(ptr as *const Registration<T>) };
+unsafe extern "C" fn handle_irq_callback<T: Handler + 'static>(
+    _irq: i32,
+    ptr: *mut c_void,
+) -> c_uint {
+    let Some(registration_ptr) = NonNull::new(ptr.cast::<Registration<T>>()) else {
+        pr_err!("IRQ handler invoked with null registration pointer\n");
+        return IrqReturn::None as c_uint;
+    };
+    // SAFETY: `registration_ptr` originates from `Registration::new`, which
+    // stores the address of a valid `Registration<T>`.
+    let registration = unsafe { registration_ptr.as_ref() };
     // SAFETY: The irq callback is removed before the device is unbound, so the fact that the irq
     // callback is running implies that the device has not yet been unbound.
     let device = unsafe { registration.inner.device().as_bound() };
@@ -423,34 +440,39 @@ impl<T: ThreadedHandler + 'static> ThreadedRegistration<T> {
     ) -> impl PinInit<Self, Error> + 'a {
         try_pin_init!(&this in Self {
             handler <- handler,
-            inner <- Devres::new(
-                request.dev,
-                try_pin_init!(RegistrationInner {
-                    // INVARIANT: `this` is a valid pointer to the `ThreadedRegistration` instance.
-                    cookie: this.as_ptr().cast::<c_void>(),
-                    irq: {
-                        // SAFETY:
-                        // - The callbacks are valid for use with request_threaded_irq.
-                        // - If this succeeds, the slot is guaranteed to be valid until the
-                        //   destructor of Self runs, which will deregister the callbacks
-                        //   before the memory location becomes invalid.
-                        // - When request_threaded_irq is called, everything that the two callbacks
-                        //   will touch has already been initialized, so it's safe for the
-                        //   callbacks to be called immediately.
-                        to_result(unsafe {
-                            bindings::request_threaded_irq(
-                                request.irq,
-                                Some(handle_threaded_irq_callback::<T>),
-                                Some(thread_fn_callback::<T>),
-                                flags.into_inner(),
-                                name.as_char_ptr(),
-                                this.as_ptr().cast::<c_void>(),
-                            )
-                        })?;
-                        request.irq
-                    }
-                })
-            ),
+            inner <- {
+                let cookie = unsafe {
+                    NonNull::new_unchecked(this.as_ptr().cast::<c_void>() as *mut c_void)
+                };
+                Devres::new(
+                    request.dev,
+                    try_pin_init!(RegistrationInner {
+                        // INVARIANT: `this` is a valid pointer to the `ThreadedRegistration` instance.
+                        cookie,
+                        irq: {
+                            // SAFETY:
+                            // - The callbacks are valid for use with request_threaded_irq.
+                            // - If this succeeds, the slot is guaranteed to be valid until the
+                            //   destructor of Self runs, which will deregister the callbacks
+                            //   before the memory location becomes invalid.
+                            // - When request_threaded_irq is called, everything that the two callbacks
+                            //   will touch has already been initialized, so it's safe for the
+                            //   callbacks to be called immediately.
+                            to_result(unsafe {
+                                bindings::request_threaded_irq(
+                                    request.irq,
+                                    Some(handle_threaded_irq_callback::<T>),
+                                    Some(thread_fn_callback::<T>),
+                                    flags.into_inner(),
+                                    name.as_char_ptr(),
+                                    cookie.as_ptr(),
+                                )
+                            })?;
+                            request.irq
+                        }
+                    }),
+                )
+            },
             _pin: PhantomPinned,
         })
     }
@@ -480,12 +502,18 @@ impl<T: ThreadedHandler + 'static> ThreadedRegistration<T> {
 /// # Safety
 ///
 /// This function should be only used as the callback in `request_threaded_irq`.
-unsafe extern "C" fn handle_threaded_irq_callback<T: ThreadedHandler>(
+unsafe extern "C" fn handle_threaded_irq_callback<T: ThreadedHandler + 'static>(
     _irq: i32,
     ptr: *mut c_void,
 ) -> c_uint {
     // SAFETY: `ptr` is a pointer to `ThreadedRegistration<T>` set in `ThreadedRegistration::new`
-    let registration = unsafe { &*(ptr as *const ThreadedRegistration<T>) };
+    let Some(registration_ptr) = NonNull::new(ptr.cast::<ThreadedRegistration<T>>()) else {
+        pr_err!("Threaded IRQ handler invoked with null registration pointer\n");
+        return ThreadedIrqReturn::None as c_uint;
+    };
+    // SAFETY: `registration_ptr` originates from `ThreadedRegistration::new`,
+    // which stores the address of a valid `ThreadedRegistration<T>`.
+    let registration = unsafe { registration_ptr.as_ref() };
     // SAFETY: The irq callback is removed before the device is unbound, so the fact that the irq
     // callback is running implies that the device has not yet been unbound.
     let device = unsafe { registration.inner.device().as_bound() };
@@ -496,9 +524,18 @@ unsafe extern "C" fn handle_threaded_irq_callback<T: ThreadedHandler>(
 /// # Safety
 ///
 /// This function should be only used as the callback in `request_threaded_irq`.
-unsafe extern "C" fn thread_fn_callback<T: ThreadedHandler>(_irq: i32, ptr: *mut c_void) -> c_uint {
+unsafe extern "C" fn thread_fn_callback<T: ThreadedHandler + 'static>(
+    _irq: i32,
+    ptr: *mut c_void,
+) -> c_uint {
     // SAFETY: `ptr` is a pointer to `ThreadedRegistration<T>` set in `ThreadedRegistration::new`
-    let registration = unsafe { &*(ptr as *const ThreadedRegistration<T>) };
+    let Some(registration_ptr) = NonNull::new(ptr.cast::<ThreadedRegistration<T>>()) else {
+        pr_err!("Threaded IRQ thread function invoked with null registration pointer\n");
+        return IrqReturn::None as c_uint;
+    };
+    // SAFETY: `registration_ptr` originates from `ThreadedRegistration::new`,
+    // which stores the address of a valid `ThreadedRegistration<T>`.
+    let registration = unsafe { registration_ptr.as_ref() };
     // SAFETY: The irq callback is removed before the device is unbound, so the fact that the irq
     // callback is running implies that the device has not yet been unbound.
     let device = unsafe { registration.inner.device().as_bound() };
