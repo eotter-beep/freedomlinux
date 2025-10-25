@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import json
 import os
 import shlex
 import shutil
@@ -324,18 +325,41 @@ def attach_loop_device(image: Path) -> str:
     return result.stdout.strip()
 
 
-def partition_and_format(config: BuildConfig) -> None:
-    device = attach_loop_device(config.output)
-    (config.work_dir / "loopdev").write_text(device, encoding="utf-8")
-
+def get_loop_device_size_bytes(device: str) -> int:
     argv = ["blockdev", "--getsize64", device]
     if os.geteuid() != 0:
         argv = ["sudo", "--"] + argv
     print(f"[build-kde] $ {' '.join(shlex.quote(part) for part in argv)}")
-    size_result = subprocess.run(
-        argv, check=True, capture_output=True, text=True
-    )
-    total_bytes = int(size_result.stdout.strip())
+    size_result = subprocess.run(argv, check=True, capture_output=True, text=True)
+    return int(size_result.stdout.strip())
+
+
+def get_image_virtual_size_bytes(image: Path) -> int:
+    argv = ("qemu-img", "info", "--output=json", str(image))
+    print(f"[build-kde] $ {' '.join(shlex.quote(part) for part in argv)}")
+    result = subprocess.run(argv, check=True, capture_output=True, text=True)
+    info = json.loads(result.stdout)
+    return int(info["virtual-size"])
+
+
+def determine_disk_size_bytes(device: str, image: Path) -> int:
+    loop_bytes = get_loop_device_size_bytes(device)
+    if loop_bytes >= 1024 * 1024:
+        return loop_bytes
+
+    image_bytes = get_image_virtual_size_bytes(image)
+    if image_bytes >= 1024 * 1024:
+        return image_bytes
+
+    # Fall back to the loop size if both measurements are unexpectedly small.
+    return loop_bytes
+
+
+def partition_and_format(config: BuildConfig) -> None:
+    device = attach_loop_device(config.output)
+    (config.work_dir / "loopdev").write_text(device, encoding="utf-8")
+
+    total_bytes = determine_disk_size_bytes(device, config.output)
 
     esp_bounds, root_bounds = calculate_partition_bounds(total_bytes)
 
