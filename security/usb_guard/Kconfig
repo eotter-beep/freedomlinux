@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config SECURITY_USB_GUARD
+	bool "USB device security policy enforcement"
+	depends on SECURITY && USB
+	select SECURITYFS
+	help
+	Enable a policy engine that blocks newly connected USB devices which
+	expose potentially dangerous functionality until they are explicitly
+	approved.  The guard rejects devices that present mass storage,
+	communication, or vendor specific interfaces unless a matching
+	vendor/product identifier pair is allowed via securityfs.
+
+	The policy can be managed through the securityfs file
+	/sys/kernel/security/usb_guard/policy.  Writing
+	"allow <vid> <pid>" adds a permanent exception and "clear" removes all
+	exceptions.  The current policy can be inspected by reading the same
+	file.  Denied devices are automatically unauthorised and require
+	manual approval before use.
+
+	If you are unsure how to answer this question, answer N.
