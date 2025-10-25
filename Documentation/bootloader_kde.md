@@ -73,8 +73,9 @@ The command performs the following steps:
    service so QEMU boots quickly without stalling on device discovery.
 7. Configures a non-root user with password-less login, sudo privileges, KDE
    auto-login through SDDM, and a desktop autostart entry for the setup helper.
-8. Installs GRUB as the bootloader, refreshes its configuration, and sets the default
-   boot target to the graphical session.
+8. Installs GRUB as the bootloader, refreshes its configuration, sets the default
+   boot target to the graphical session, and configures GRUB to remember the last
+   kernel that successfully booted so follow-up restarts keep using it automatically.
 
 When the script finishes it prints the path to the QCOW2 disk image and the ISO
 image that is copied to `releases/iso/`. The installer ISO is also copied into
@@ -93,7 +94,9 @@ qemu-system-x86_64 \
 
 If you prefer a turnkey experience that always writes the artifacts to
 `releases/iso/`, use the convenience wrapper that lives alongside the release
-directory:
+directory. The wrapper now produces a bootable `.iso` image by default and
+discards the intermediate QCOW2 disk once the ISO has been created. Pass
+`--keep-qcow2` if you would like to retain the virtual-disk artifact as well:
 
 ```bash
 python3 releases/iso/create_iso.py --size-gb 20 --hostname plasma-lab
@@ -101,7 +104,8 @@ python3 releases/iso/create_iso.py --size-gb 20 --hostname plasma-lab
 
 The wrapper exposes the most common configuration options and delegates the
 heavy lifting to `tools/bootloader/build_kde_image.py`, so you get identical
-outputs with less typing.
+outputs with less typing. Use `--iso-name` to override the ISO filename while
+still targeting the same release directory.
 
 ## First boot workflow
 
@@ -112,6 +116,11 @@ assistant automatically launches the Calamares installer so you can finish
 installing the system to disk. The helper removes itself from KDE's autostart
 directory once it starts Calamares, so it will not appear again on subsequent
 logins.
+
+Each interactive shell session also evaluates pending package updates and emits
+warnings in the form `UPDATE: <package> needs to be updated to <suite>:<version>`
+whenever new versions are available. This makes it easy to notice when core
+components such as the bootloader or desktop environment have fresh releases.
 
 Pressing <kbd>Alt</kbd>+<kbd>S</kbd> opens a snapshot manager that talks to
 libvirt. The manager lets you inspect the virtual machines present on the live

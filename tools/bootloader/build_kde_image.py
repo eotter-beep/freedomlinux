@@ -81,6 +81,7 @@ class BuildConfig:
     hostname: str = "freedomlinux"
     username: str = "builder"
     iso_directory: Path = DEFAULT_ISO_DIR
+    iso_name: str | None = None
 
     @property
     def work_dir(self) -> Path:
@@ -96,6 +97,8 @@ class BuildConfig:
 
     @property
     def iso_path(self) -> Path:
+        if self.iso_name:
+            return self.iso_directory / self.iso_name
         return self.iso_directory / f"{self.output.stem}.iso"
 
 
@@ -189,6 +192,11 @@ def parse_args(argv: Sequence[str]) -> BuildConfig:
         help="Directory where generated ISO images will be stored.",
     )
     parser.add_argument(
+        "--iso-name",
+        default=None,
+        help="Optional file name for the generated ISO (defaults to output stem).",
+    )
+    parser.add_argument(
         "output",
         type=Path,
         help="Path where the disk image should be written.",
@@ -202,7 +210,23 @@ def parse_args(argv: Sequence[str]) -> BuildConfig:
         hostname=args.hostname,
         username=args.user,
         iso_directory=args.iso_dir.resolve(),
+        iso_name=_normalise_iso_name(args.iso_name),
     )
+
+
+def _normalise_iso_name(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    name = Path(value).name
+    stem = Path(name).stem
+    if not stem:
+        raise ValueError("ISO name must contain non-empty filename")
+
+    if name.endswith(".iso"):
+        return name
+
+    return f"{stem}.iso"
 
 
 def ensure_tools_available() -> None:
@@ -225,6 +249,14 @@ def write_file(path: Path, content: str) -> None:
         return
     Command(("mkdir", "-p", str(path.parent)), sudo=True).run()
     Command(("tee", str(path)), sudo=True, input_data=content, text=True).run()
+
+
+def write_executable(path: Path, content: str) -> None:
+    write_file(path, content)
+    if os.geteuid() == 0:
+        path.chmod(0o755)
+    else:
+        Command(("chmod", "755", str(path)), sudo=True).run()
 
 
 def create_image(config: BuildConfig) -> None:
@@ -253,6 +285,16 @@ def attach_loop_device(image: Path) -> str:
 def partition_and_format(config: BuildConfig) -> None:
     device = attach_loop_device(config.output)
     (config.work_dir / "loopdev").write_text(device, encoding="utf-8")
+
+    esp_start_mib = 1
+    esp_end_mib = 513
+    root_start_mib = esp_end_mib
+    root_end_mib = config.image_size_gb * 1024 - 1
+    if root_end_mib <= root_start_mib:
+        raise RuntimeError(
+            "Configured disk image is too small to contain the root partition"
+        )
+
     run_commands(
         (
             Command(("parted", "-s", device, "mklabel", "gpt"), sudo=True),
@@ -262,14 +304,15 @@ def partition_and_format(config: BuildConfig) -> None:
                     "-s",
                     device,
                     "mkpart",
-                    "ESP",
+                    "primary",
                     "fat32",
-                    "1MiB",
-                    "513MiB",
+                    f"{esp_start_mib}MiB",
+                    f"{esp_end_mib}MiB",
                 ),
                 sudo=True,
             ),
-            Command(("parted", "-s", device, "set", "1", "boot", "on"), sudo=True),
+            Command(("parted", "-s", device, "name", "1", "ESP"), sudo=True),
+            Command(("parted", "-s", device, "set", "1", "esp", "on"), sudo=True),
             Command(
                 (
                     "parted",
@@ -278,11 +321,12 @@ def partition_and_format(config: BuildConfig) -> None:
                     "mkpart",
                     "primary",
                     "ext4",
-                    "513MiB",
-                    "100%",
+                    f"{root_start_mib}MiB",
+                    f"{root_end_mib}MiB",
                 ),
                 sudo=True,
             ),
+            Command(("parted", "-s", device, "name", "2", "rootfs"), sudo=True),
         )
     )
     run_commands(
@@ -402,6 +446,84 @@ def configure_system(config: BuildConfig) -> None:
         )
     )
 
+    update_warning_script = (
+        config.root_dir / "usr" / "local" / "bin" / "freedomlinux-update-warning"
+    )
+    write_executable(
+        update_warning_script,
+        textwrap.dedent(
+            """#!/usr/bin/env python3
+            from __future__ import annotations
+
+            import subprocess
+
+
+            def gather_updates() -> list[str]:
+                try:
+                    result = subprocess.run(
+                        ("apt", "list", "--upgradable"),
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                except (FileNotFoundError, subprocess.CalledProcessError):
+                    return []
+
+                warnings: list[str] = []
+                for raw_line in result.stdout.splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("Listing..."):
+                        continue
+
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+
+                    package_component = parts[0]
+                    version_number = parts[1]
+
+                    if "/" in package_component:
+                        package_name, release_component = package_component.split("/", 1)
+                    else:
+                        package_name = package_component
+                        release_component = "unknown"
+
+                    version_name = release_component.split(",", 1)[0]
+
+                    warnings.append(
+                        f"UPDATE: {package_name} needs to be updated to {version_name}:{version_number}"
+                    )
+
+                return warnings
+
+
+            def main() -> int:
+                warnings = gather_updates()
+                if not warnings:
+                    return 0
+
+                for warning in warnings:
+                    print(warning)
+                return 0
+
+
+            if __name__ == "__main__":
+                raise SystemExit(main())
+            """
+        ),
+    )
+
+    write_file(
+        config.root_dir / "etc" / "profile.d" / "freedomlinux-update-warning.sh",
+        textwrap.dedent(
+            """#!/bin/sh
+            if [ -x /usr/local/bin/freedomlinux-update-warning ]; then
+                /usr/local/bin/freedomlinux-update-warning
+            fi
+            """
+        ),
+    )
+
     # QEMU boots noticeably faster when the initramfs already contains the
     # paravirtualized drivers required for virtio devices. Ensure they are
     # seeded so the kernel does not have to fall back to slow legacy paths
@@ -422,6 +544,35 @@ def configure_system(config: BuildConfig) -> None:
     run_commands((chroot_cmd("update-initramfs", "-u"),))
 
     compile_source_packages(chroot_cmd)
+
+    write_file(
+        config.root_dir / "etc" / "default" / "grub.d" / "freedomlinux-auto.cfg",
+        textwrap.dedent(
+            """GRUB_DEFAULT=saved
+            GRUB_SAVEDEFAULT=true
+            """
+        ),
+    )
+
+    kernel_postinst_script = (
+        config.root_dir
+        / "etc"
+        / "kernel"
+        / "postinst.d"
+        / "zz-freedomlinux-set-default"
+    )
+    write_executable(
+        kernel_postinst_script,
+        textwrap.dedent(
+            """#!/bin/sh
+            set -e
+
+            if command -v grub-set-default >/dev/null 2>&1; then
+                grub-set-default 0 || true
+            fi
+            """
+        ),
+    )
 
     run_commands(
         (
@@ -979,6 +1130,7 @@ def configure_system(config: BuildConfig) -> None:
                 "--bootloader-id=freedomlinux",
             ),
             chroot_cmd("update-grub"),
+            chroot_cmd("grub-set-default", "0"),
         )
     )
 
@@ -1079,7 +1231,11 @@ def cleanup(config: BuildConfig) -> None:
 
 
 def main(argv: Sequence[str]) -> int:
-    config = parse_args(argv)
+    try:
+        config = parse_args(argv)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     ensure_tools_available()
     config.work_dir.mkdir(parents=True, exist_ok=True)
 

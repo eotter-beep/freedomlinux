@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_IMAGE_NAME = "freedomlinux-kde.qcow2"
+DEFAULT_ISO_NAME = "freedomlinux-kde.iso"
 DEFAULT_ARCH = "amd64"
 DEFAULT_RELEASE = "bookworm"
 DEFAULT_SIZE_GB = 16
@@ -55,9 +55,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Non-root user created inside the generated system.",
     )
     parser.add_argument(
-        "--image-name",
-        default=DEFAULT_IMAGE_NAME,
-        help="Filename for the QCOW2 disk image stored in releases/iso.",
+        "--iso-name",
+        default=DEFAULT_ISO_NAME,
+        help="Filename for the ISO image stored in releases/iso.",
     )
     parser.add_argument(
         "--iso-dir",
@@ -65,13 +65,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=REPO_ROOT / "releases" / "iso",
         help="Directory where ISO release artifacts should be written.",
     )
+    parser.add_argument(
+        "--keep-qcow2",
+        action="store_true",
+        help="Preserve the intermediate QCOW2 disk image generated during the build.",
+    )
     return parser.parse_args(argv)
 
 
 def build_iso(args: argparse.Namespace) -> int:
     iso_dir = args.iso_dir.resolve()
     iso_dir.mkdir(parents=True, exist_ok=True)
-    output_path = iso_dir / args.image_name
+    iso_name = Path(args.iso_name).name
+    if not iso_name.endswith(".iso"):
+        iso_name = f"{Path(iso_name).stem}.iso"
+
+    qcow2_name = f"{Path(iso_name).stem}.qcow2"
+    qcow2_path = iso_dir / qcow2_name
 
     build_args = [
         "--arch",
@@ -86,10 +96,19 @@ def build_iso(args: argparse.Namespace) -> int:
         args.user,
         "--iso-dir",
         str(iso_dir),
-        str(output_path),
+        "--iso-name",
+        iso_name,
+        str(qcow2_path),
     ]
 
-    return build_kde_image.main(build_args)
+    result = build_kde_image.main(build_args)
+    if result != 0:
+        return result
+
+    if not args.keep_qcow2:
+        qcow2_path.unlink(missing_ok=True)
+
+    return 0
 
 
 def main(argv: list[str]) -> int:
