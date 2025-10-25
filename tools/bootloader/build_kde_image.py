@@ -83,6 +83,9 @@ class BuildConfig:
     username: str = "builder"
     iso_directory: Path = DEFAULT_ISO_DIR
     iso_name: str | None = None
+    esp_uuid: str | None = None
+    root_uuid: str | None = None
+    root_partuuid: str | None = None
 
     @property
     def work_dir(self) -> Path:
@@ -342,6 +345,22 @@ def get_image_virtual_size_bytes(image: Path) -> int:
     return int(info["virtual-size"])
 
 
+def get_partition_field(device: str, field: str) -> str:
+    argv = ["blkid", "-s", field, "-o", "value", device]
+    if os.geteuid() != 0:
+        argv = ["sudo", "--"] + argv
+    display = " ".join(shlex.quote(part) for part in argv)
+    print(f"[build-kde] $ {display}")
+    try:
+        result = subprocess.run(argv, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:  # pragma: no cover - passthrough
+        raise CommandError(f"command {display} failed with exit code {exc.returncode}") from exc
+    value = result.stdout.strip()
+    if not value:
+        raise CommandError(f"blkid did not return a {field} for {device}")
+    return value
+
+
 def determine_disk_size_bytes(device: str, image: Path) -> int:
     loop_bytes = get_loop_device_size_bytes(device)
     if loop_bytes >= 1024 * 1024:
@@ -403,6 +422,11 @@ def partition_and_format(config: BuildConfig) -> None:
             Command(("mkfs.ext4", f"{device}p2"), sudo=True),
         )
     )
+
+    config.esp_uuid = get_partition_field(f"{device}p1", "UUID")
+    config.root_uuid = get_partition_field(f"{device}p2", "UUID")
+    config.root_partuuid = get_partition_field(f"{device}p2", "PARTUUID")
+
     config.mount_dir.mkdir(parents=True, exist_ok=True)
     run_commands(
         (
@@ -514,6 +538,18 @@ def configure_system(config: BuildConfig) -> None:
         )
     )
 
+    if not config.root_uuid:
+        raise RuntimeError("Root filesystem UUID was not captured during partitioning")
+
+    fstab_lines = [
+        "# /etc/fstab: static file system information.",
+        f"UUID={config.root_uuid} / ext4 defaults 0 1",
+    ]
+    if config.esp_uuid:
+        fstab_lines.append(f"UUID={config.esp_uuid} /boot/efi vfat umask=0077 0 2")
+    fstab_lines.append("tmpfs /tmp tmpfs defaults,nosuid,nodev 0 0")
+    write_file(config.root_dir / "etc" / "fstab", "\n".join(fstab_lines) + "\n")
+
     update_warning_script = (
         config.root_dir / "usr" / "local" / "bin" / "freedomlinux-update-warning"
     )
@@ -621,6 +657,15 @@ def configure_system(config: BuildConfig) -> None:
             """
         ),
     )
+
+    if config.root_partuuid:
+        write_file(
+            config.root_dir / "etc" / "default" / "grub.d" / "freedomlinux-root.cfg",
+            textwrap.dedent(
+                f"""GRUB_CMDLINE_LINUX="root=PARTUUID={config.root_partuuid}"
+                """
+            ),
+        )
 
     kernel_postinst_script = (
         config.root_dir
