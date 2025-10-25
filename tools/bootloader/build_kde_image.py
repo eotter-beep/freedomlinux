@@ -402,6 +402,25 @@ def configure_system(config: BuildConfig) -> None:
         )
     )
 
+    # QEMU boots noticeably faster when the initramfs already contains the
+    # paravirtualized drivers required for virtio devices. Ensure they are
+    # seeded so the kernel does not have to fall back to slow legacy paths
+    # while probing for the root disk inside the hypervisor.
+    write_file(
+        config.root_dir / "etc" / "initramfs-tools" / "modules",
+        textwrap.dedent(
+            """# FreedomLinux virtualization essentials
+            virtio_pci
+            virtio_blk
+            virtio_scsi
+            virtiofs
+            virtio_net
+            """
+        ),
+    )
+
+    run_commands((chroot_cmd("update-initramfs", "-u"),))
+
     compile_source_packages(chroot_cmd)
 
     run_commands(
@@ -410,6 +429,7 @@ def configure_system(config: BuildConfig) -> None:
             chroot_cmd("systemctl", "enable", "sddm"),
             chroot_cmd("systemctl", "enable", "network-manager"),
             chroot_cmd("systemctl", "enable", "libvirtd"),
+            chroot_cmd("systemctl", "mask", "NetworkManager-wait-online.service"),
         )
     )
 

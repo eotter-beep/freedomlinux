@@ -69,9 +69,11 @@ The command performs the following steps:
    libvirt-powered snapshot manager.
 5. Recompiles PulseAudio, GTK, and QEMU from their Debian source packages and installs
    the resulting binaries into the image.
-6. Configures a non-root user with password-less login, sudo privileges, KDE
+6. Seeds the initramfs with virtio drivers and disables NetworkManager's wait-online
+   service so QEMU boots quickly without stalling on device discovery.
+7. Configures a non-root user with password-less login, sudo privileges, KDE
    auto-login through SDDM, and a desktop autostart entry for the setup helper.
-7. Installs GRUB as the bootloader, refreshes its configuration, and sets the default
+8. Installs GRUB as the bootloader, refreshes its configuration, and sets the default
    boot target to the graphical session.
 
 When the script finishes it prints the path to the QCOW2 disk image and the ISO
