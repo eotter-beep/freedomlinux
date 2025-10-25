@@ -27,6 +27,7 @@ USB support
     raw-gadget
     usbip_protocol
     usbmon
+    usb-guard
     usb-serial
 
     usb-help
