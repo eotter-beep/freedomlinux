@@ -86,6 +86,18 @@ qemu-system-x86_64 \
     -display sdl
 ```
 
+If you prefer a turnkey experience that always writes the artifacts to
+`releases/iso/`, use the convenience wrapper that lives alongside the release
+directory:
+
+```bash
+python3 releases/iso/create_iso.py --size-gb 20 --hostname plasma-lab
+```
+
+The wrapper exposes the most common configuration options and delegates the
+heavy lifting to `tools/bootloader/build_kde_image.py`, so you get identical
+outputs with less typing.
+
 ## First boot workflow
 
 The autologin session starts a "FreedomLinux Setup" helper on the KDE desktop.
