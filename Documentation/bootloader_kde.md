@@ -77,14 +77,17 @@ The command performs the following steps:
    boot target to the graphical session.
 
 When the script finishes it prints the path to the QCOW2 disk image and the ISO
-image that is copied to `releases/iso/`. You can boot the QCOW2 image with any
+image that is copied to `releases/iso/`. The installer ISO is also copied into
+the disk image at `/srv/freedomlinux/iso/<image>.iso` so the live environment
+always has a bootable copy of the release artifact available locally. You can
+boot the QCOW2 image with any
 EFI capable hypervisor. For example, using QEMU:
 
 ```bash
 qemu-system-x86_64 \
     -enable-kvm \
     -m 4096 \
-    -drive file=out/freedomlinux-kde.qcow2,if=virtio \
+    -drive file=out/freedomlinux-kde.qcow2,if=virtio,format=qcow2 \
     -display sdl
 ```
 

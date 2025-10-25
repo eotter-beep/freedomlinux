@@ -1034,6 +1034,24 @@ def create_iso_release(config: BuildConfig) -> None:
         ).run()
 
 
+def embed_iso_into_disk(config: BuildConfig) -> None:
+    """Copy the generated ISO into the QCOW2 image for on-box access."""
+
+    iso_in_disk_dir = config.root_dir / "srv" / "freedomlinux" / "iso"
+    iso_in_disk = iso_in_disk_dir / config.iso_path.name
+
+    run_commands(
+        (
+            Command(("mkdir", "-p", str(iso_in_disk_dir)), sudo=True),
+            Command(("cp", "-f", str(config.iso_path), str(iso_in_disk)), sudo=True),
+            Command(
+                ("chown", "-R", f"{config.username}:{config.username}", str(iso_in_disk_dir)),
+                sudo=True,
+            ),
+        )
+    )
+
+
 def cleanup(config: BuildConfig) -> None:
     targets = (
         config.root_dir / "boot" / "efi",
@@ -1071,8 +1089,13 @@ def main(argv: Sequence[str]) -> int:
         run_debootstrap(config)
         configure_system(config)
         create_iso_release(config)
+        embed_iso_into_disk(config)
         print("Disk image created successfully:", config.output)
         print("ISO image created successfully:", config.iso_path)
+        print(
+            "ISO image copied into the disk at /srv/freedomlinux/iso/"
+            f"{config.iso_path.name}"
+        )
         return 0
     except CommandError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
