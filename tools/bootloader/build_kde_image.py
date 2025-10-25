@@ -102,6 +102,48 @@ class BuildConfig:
         return self.iso_directory / f"{self.output.stem}.iso"
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class PartitionBounds:
+    """Inclusive partition boundary expressed in mebibytes."""
+
+    start_mib: int
+    end_mib: int
+
+
+def calculate_partition_bounds(
+    total_bytes: int, *, esp_size_mib: int = 512
+) -> tuple[PartitionBounds, PartitionBounds]:
+    """Derive partition boundaries that remain within the available space."""
+
+    if total_bytes <= 0:
+        raise ValueError("Disk image must be larger than zero bytes")
+
+    total_mib = total_bytes // (1024 * 1024)
+    if total_mib <= 0:
+        raise ValueError("Disk image is too small to partition (less than 1 MiB)")
+
+    esp_start_mib = 1
+    esp_end_mib = esp_start_mib + esp_size_mib
+
+    if total_mib <= esp_end_mib:
+        raise ValueError(
+            "Disk image is too small to contain the ESP and root partitions"
+        )
+
+    root_start_mib = esp_end_mib
+    root_end_mib = total_mib - 1
+
+    if root_end_mib <= root_start_mib:
+        raise ValueError(
+            "Disk image does not have enough space for the root partition"
+        )
+
+    return (
+        PartitionBounds(esp_start_mib, esp_end_mib),
+        PartitionBounds(root_start_mib, root_end_mib),
+    )
+
+
 REQUIRED_PACKAGES: tuple[str, ...] = (
     "apt",
     "build-essential",
@@ -286,14 +328,16 @@ def partition_and_format(config: BuildConfig) -> None:
     device = attach_loop_device(config.output)
     (config.work_dir / "loopdev").write_text(device, encoding="utf-8")
 
-    esp_start_mib = 1
-    esp_end_mib = 513
-    root_start_mib = esp_end_mib
-    root_end_mib = config.image_size_gb * 1024 - 1
-    if root_end_mib <= root_start_mib:
-        raise RuntimeError(
-            "Configured disk image is too small to contain the root partition"
-        )
+    argv = ["blockdev", "--getsize64", device]
+    if os.geteuid() != 0:
+        argv = ["sudo", "--"] + argv
+    print(f"[build-kde] $ {' '.join(shlex.quote(part) for part in argv)}")
+    size_result = subprocess.run(
+        argv, check=True, capture_output=True, text=True
+    )
+    total_bytes = int(size_result.stdout.strip())
+
+    esp_bounds, root_bounds = calculate_partition_bounds(total_bytes)
 
     run_commands(
         (
@@ -306,8 +350,8 @@ def partition_and_format(config: BuildConfig) -> None:
                     "mkpart",
                     "primary",
                     "fat32",
-                    f"{esp_start_mib}MiB",
-                    f"{esp_end_mib}MiB",
+                    f"{esp_bounds.start_mib}MiB",
+                    f"{esp_bounds.end_mib}MiB",
                 ),
                 sudo=True,
             ),
@@ -321,8 +365,8 @@ def partition_and_format(config: BuildConfig) -> None:
                     "mkpart",
                     "primary",
                     "ext4",
-                    f"{root_start_mib}MiB",
-                    f"{root_end_mib}MiB",
+                    f"{root_bounds.start_mib}MiB",
+                    f"{root_bounds.end_mib}MiB",
                 ),
                 sudo=True,
             ),
